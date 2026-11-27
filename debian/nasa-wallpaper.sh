@@ -10,6 +10,21 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/nasa-wallpaper"
 TEMP_DIR="${TMPDIR:-/tmp}/nasa-wallpaper"
 HTTP_TIMEOUT=20
 DOWNLOAD_TIMEOUT=30
+MAX_REDIRS=5
+# La NASA Image Library restituisce al massimo 100 pagine da 100 risultati.
+MAX_PAGES=100
+TEMP_FILES=()
+NEW_TEMP=''
+
+cleanup_temp() {
+    local file
+    for file in "${TEMP_FILES[@]}"; do
+        [[ -e "$file" ]] && rm -f -- "$file"
+    done
+    return 0
+}
+
+trap cleanup_temp EXIT
 
 log_info() {
     local message="$1"
@@ -103,12 +118,34 @@ date_code() {
     fi
 }
 
-http_get() {
-    local url="$1"
+# Crea un file temporaneo in NEW_TEMP e lo registra per la pulizia in uscita.
+# Va chiamata senza $(...): in una subshell la registrazione andrebbe persa.
+new_temp() {
+    # mktemp con solo il modello XXXXXX: portabile tra GNU, BSD e macOS.
+    NEW_TEMP=$(mktemp "${TEMP_DIR}/nasa-wallpaper.XXXXXX") || return 1
+    TEMP_FILES+=("$NEW_TEMP")
+}
+
+# Scarica $1 in $2 e verifica che l'host finale, dopo i redirect, sia autorizzato.
+fetch() {
+    local url="$1" output="$2" max_time="$3" final_url
     validate_https_url "$url" || return 1
-    curl --fail-with-body --silent --show-error --location \
-        --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --max-time "$HTTP_TIMEOUT" "$url" || return 1
+    final_url=$(curl --fail-with-body --silent --show-error --location \
+        --max-redirs "$MAX_REDIRS" --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --max-time "$max_time" --output "$output" --write-out '%{url_effective}' "$url") || return 1
+    if ! validate_https_url "$final_url"; then
+        log_error "Redirect verso un host non autorizzato: $final_url"
+        return 1
+    fi
+}
+
+# Gira dentro $(...): il file del corpo si rimuove qui, non dalla trap del genitore.
+http_get() {
+    local url="$1" body rc=0
+    body=$(mktemp "${TEMP_DIR}/nasa-wallpaper.XXXXXX") || return 1
+    fetch "$url" "$body" "$HTTP_TIMEOUT" && cat -- "$body" || rc=1
+    rm -f -- "$body"
+    return "$rc"
 }
 
 set_apod() {
@@ -171,7 +208,9 @@ set_nasa_image() {
 
     local pages=$(( (total_hits + 99) / 100 ))
     (( pages > 1 )) || pages=1
-    local page=$(( RANDOM % pages ))
+    (( pages <= MAX_PAGES )) || pages=$MAX_PAGES
+    # Le pagine dell'API partono da 1.
+    local page=$(( RANDOM % pages + 1 ))
     local page_response
     page_response=$(http_get "$url&page=$page") || die 'Recupero pagina non riuscito'
 
@@ -211,16 +250,15 @@ set_wallpaper_from_url() {
     safe_name="${safe_name:0:48}"
     [[ -n "$safe_name" ]] || safe_name='wallpaper'
 
-    local filename
-    filename=$(mktemp --suffix=".${ext}" "${TEMP_DIR}/${safe_name}.XXXXXX") || die 'Creazione del file temporaneo non riuscita'
+    local download filename="${CACHE_DIR}/${safe_name}.${ext}"
+    new_temp || die 'Creazione del file temporaneo non riuscita'
+    download="$NEW_TEMP"
 
     log_info 'Download immagine...'
-    if ! curl --fail-with-body --silent --show-error --location \
-        --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --max-time "$DOWNLOAD_TIMEOUT" --output "$filename" "$url"; then
-        die 'Download immagine non riuscito'
-    fi
-    [[ -s "$filename" ]] || die 'File immagine vuoto'
+    fetch "$url" "$download" "$DOWNLOAD_TIMEOUT" || die 'Download immagine non riuscito'
+    [[ -s "$download" ]] || die 'File immagine vuoto'
+    # Lo sfondo resta in cache: il desktop lo legge anche dopo la fine dello script.
+    mv -f -- "$download" "$filename" || die "Salvataggio immagine non riuscito: $filename"
 
     if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/dev/null 2>&1; then
         local winpath
